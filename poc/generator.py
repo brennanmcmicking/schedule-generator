@@ -2,7 +2,13 @@ import json
 import requests
 import re
 import datetime
+import sys
 from random import randint
+import asyncio
+from websockets.server import serve, WebSocketServer
+from websockets.legacy.server import WebSocketServerProtocol
+from multiprocessing import Pool
+from urllib.parse import urlsplit, parse_qs
 
 class SetEncoder(json.JSONEncoder):
   def default(self, obj):
@@ -11,31 +17,81 @@ class SetEncoder(json.JSONEncoder):
     return json.JSONEncoder.default(self, obj)
 
 
+# COURSES = [
+#   {
+#     'subject': 'MATH',
+#     'code': '100'
+#   },
+#   {
+#     'subject': 'CSC',
+#     'code': '111'
+#   },
+#   {
+#     'subject': 'MATH',
+#     'code': '110',
+#   },
+#   {
+#     'subject': 'PHYS',
+#     'code': '110'
+#   },
+#   {
+#     'subject': 'ENGR',
+#     'code': '110',
+#   },
+#   {
+#     'subject': 'ENGR',
+#     'code': '130',
+#   }
+# ]
+
+# COURSES = [
+#   {
+#     'subject': 'SENG',
+#     'code': '460',
+#   },
+#   {
+#     'subject': 'SENG',
+#     'code': '371',
+#   },
+#   {
+#     'subject': 'CSC',
+#     'code': '402',
+#   },
+#   {
+#     'subject': 'TS',
+#     'code': '400',
+#   },
+#   {
+#     'subject': 'SENG',
+#     'code': '401',
+#   },
+# ]
+
 COURSES = [
   {
+    'subject': 'SENG',
+    'code': '265',
+  },
+  {
+    'subject': 'ECE',
+    'code': '260',
+  },
+  {
+    'subject': 'STAT',
+    'code': '260',
+  },
+  {
     'subject': 'MATH',
-    'code': '100'
+    'code': '122',
   },
   {
-    'subject': 'CSC',
-    'code': '111'
+    'subject': 'ECE',
+    'code': '255',
   },
   {
-    'subject': 'MATH',
-    'code': '110',
+    'subject': 'CHEM',
+    'code': '150',
   },
-  {
-    'subject': 'PHYS',
-    'code': '110'
-  },
-  {
-    'subject': 'ENGR',
-    'code': '110',
-  },
-  {
-    'subject': 'ENGR',
-    'code': '130',
-  }
 ]
 
 # groups:
@@ -47,6 +103,7 @@ COURSES = [
 # 6 = end am or pm
 time_extractor = re.compile(r'(\d{1,2}):(\d{2})\s([a|p]m)\s-\s(\d{1,2}):(\d{2})\s([a|p]m)')
 
+course_name_extractor = re.compile(r'^([a-zA-Z]+)(\d+)$')
 
 # {
 #   meeting_times: [
@@ -118,14 +175,7 @@ def meeting_times_conflict(one, two):
 
   return False
 
-def has_conflict(meeting_times: list, earliest_start_hour: int, latest_end_hour: int):
-  for meeting in meeting_times:
-    if meeting["start_time"]["hr"] < earliest_start_hour:
-      return True
-
-    if meeting["end_time"]["hr"] >= latest_end_hour:
-      return True
-
+def has_conflict(meeting_times: list):
   for i, time in enumerate(meeting_times):
     for j in range(len(meeting_times)):
       if i != j:
@@ -136,7 +186,7 @@ def has_conflict(meeting_times: list, earliest_start_hour: int, latest_end_hour:
   return False
 
 
-def process_section(section: dict) -> dict:
+def process_section(section: dict, earliest_start_hour: int, latest_end_hour: int) -> dict:
   # print(section)
   result = {
     "meeting_times": [],
@@ -144,6 +194,7 @@ def process_section(section: dict) -> dict:
     "crn": section["crn"],
   }
 
+  within_time_bounds = True
   for meeting in section["meetingTimes"]:
     # print(meeting["time"])
     if meeting["time"] != "TBA": 
@@ -161,22 +212,23 @@ def process_section(section: dict) -> dict:
         }
       }
 
+      if meeting_info["start_time"]["hr"] < earliest_start_hour or meeting_info["end_time"]["hr"] > latest_end_hour:
+        within_time_bounds = False
+        break
+
       result["meeting_times"].append(meeting_info)
 
   # print(type(result["meeting_times"]))
   # fs = frozenset(result["meeting_times"])  
   # result["meeting_times_hash"] = hash(fs)
 
-  return result
+  if within_time_bounds:
+    return result
+  else:
+    return None
 
 
-{
-  "meeting_times": {},
-  "crns": [],
-  "type": "A|B|T",
-}
-
-def process_courses(course_list):
+def process_courses(course_list, earliest_start_hour = 7, latest_end_hour = 23):
   processed_courses = []
 
   for course in course_list:
@@ -193,25 +245,26 @@ def process_courses(course_list):
     res = requests.get(url)
     if res.status_code == 200:
       for section in res.json():
-        s = process_section(section)
+        s = process_section(section, earliest_start_hour, latest_end_hour)
 
-        found_same = False
-        for sec in sections[s["section_type"]]:
-          if sec["meeting_times"] == s["meeting_times"]:
-            sec["crns"].append(s["crn"])
-            sec["codes"].append(section["sectionCode"])
-            found_same = True
-            # print("found duplicate:")
-            # print(s)
+        if s:
+          found_same = False
+          for sec in sections[s["section_type"]]:
+            if sec["meeting_times"] == s["meeting_times"]:
+              sec["crns"].append(s["crn"])
+              sec["codes"].append(section["sectionCode"])
+              found_same = True
+              # print("found duplicate:")
+              # print(s)
 
-        if not found_same:
-          sections[s["section_type"]].append({
-            "crns": [s["crn"]],
-            "meeting_times": s["meeting_times"],
-            "type": s["section_type"],
-            "name": course_name,
-            "codes": [section["sectionCode"]]
-          })
+          if not found_same:
+            sections[s["section_type"]].append({
+              "crns": [s["crn"]],
+              "meeting_times": s["meeting_times"],
+              "type": s["section_type"],
+              "name": course_name,
+              "codes": [section["sectionCode"]]
+            })
 
     processed_courses.append({
       "name": course_name,
@@ -237,13 +290,10 @@ def process_courses(course_list):
   return num_permutations, processed_courses
       
 
-def main():
-  perms, courses = process_courses(COURSES)
+async def find_all(course_list, websocket):
+  perms, courses = process_courses(course_list, 7, 23)
   # print(json.dumps(courses, indent=2, cls=SetEncoder))
   
-  # N = 1000000
-  N = 110702592
-
   delta_ms = 0
   found_non_conflicted = False
   non_conflicting = []
@@ -283,7 +333,7 @@ def main():
 
   try:
     for count in range(perms):
-      # print(indexes)
+      print(indexes)
       meetings_to_check = []
       current_sections = []
       for i in range(len(indexes)):
@@ -292,9 +342,11 @@ def main():
           meetings_to_check.append(meeting)
         current_sections.append(section)
       
-      conflicted = has_conflict(meetings_to_check, 7, 17)
+      conflicted = has_conflict(meetings_to_check)
       if not conflicted:
         non_conflicting.append(current_sections)
+        # print(f'sending section {current_sections}')
+        await websocket.send(json.dumps(current_sections, cls=SetEncoder))
 
       indexes[-1] += 1
       for i in range(len(indexes) - 1, 0, -1):
@@ -310,15 +362,55 @@ def main():
 
   
   end_time = datetime.datetime.now()
-  print(f"found non-conflicting schedule? {len(non_conflicting)}")
-  print(f"elapsed time: {(end_time - start_time).total_seconds()} seconds")
-  # print(json.dumps(non_conflicting[-1], indent=2, cls=SetEncoder))
-  for schedule in non_conflicting:
-    print("==== START SCHEDULE")
-    for section in schedule:
-      print(f"{section['name']}: {section['codes']}")
+  # print(f"found non-conflicting schedule? {len(non_conflicting)}")
+  # print(f"elapsed time: {(end_time - start_time).total_seconds()} seconds")
+  # # print(json.dumps(non_conflicting[-1], indent=2, cls=SetEncoder))
+  # for schedule in non_conflicting:
+  #   print("==== START SCHEDULE")
+  #   for section in schedule:
+  #     print(f"{section['name']}: {section['codes']}")
 
-  print(len(non_conflicting))
+  # print(len(non_conflicting))
+  # print(f'number of permutations: {perms}')
+
+async def handle_new_websocket(websocket: WebSocketServerProtocol):
+  print("new websocket opened")
+  query = urlsplit(websocket.path).query
+  params = parse_qs(query)
+  print(params)
+
+  course_list = []
+  for course in params["c"]:
+    m = course_name_extractor.match(course)
+    if m:
+      course_list.append({
+        'subject': m.group(1),
+        'code': m.group(2),
+      })
+
+  print(course_list)
+  await find_all(course_list, websocket)
+
+  await websocket.close()
+
+async def open_websocket_server():
+  async with serve(handle_new_websocket, "localhost", 8765):
+    await asyncio.Future()
+
+def main():
+  # course_list = []
+  # for arg in sys.argv:
+  #   m = course_name_extractor.match(arg)
+  #   if m:
+  #     course_list.append({
+  #       'subject': m.group(1),
+  #       'code': m.group(2),
+  #     })
+
+  # print(course_list)
+  # find_all(course_list)
+
+  asyncio.run(open_websocket_server())
 
 if __name__ == "__main__":
   main()
